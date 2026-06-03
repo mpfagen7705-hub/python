@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "assassins-reverie"
+version = "1.0.0"
+description = "A 2D top-down stealth-action RPG inspired by Assassin's Creed."
+requires-python = ">=3.10"
+dependencies = ["pygame>=2.5,<3.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["assassin", "assassin.entities", "assassin.systems", "assassin.ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
