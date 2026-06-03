@@ -64,6 +64,29 @@ GUARD_ATTACK_COOLDOWN = 0.9    # seconds
 GUARD_BASE_HP = 60
 GUARD_DAMAGE = 14
 
+# Enemy variants ------------------------------------------------------------
+# Archers: fragile, keep their distance and fire arrows.
+ARCHER_HP = 35
+ARCHER_DAMAGE = 16
+ARCHER_SHOOT_RANGE = 280.0
+ARCHER_SHOOT_COOLDOWN = 1.6     # seconds between shots
+ARCHER_KEEP_DISTANCE = 150.0    # tries to stay at least this far from the player
+ARCHER_VISION_MULT = 1.25
+# Brutes: slow, heavily armored, hit like a battering ram.
+BRUTE_HP = 150
+BRUTE_DAMAGE = 28
+BRUTE_SPEED_MULT = 0.7
+BRUTE_DEFENSE = 8
+
+PROJECTILE_SPEED = 430.0
+PROJECTILE_RADIUS = 4
+PROJECTILE_LIFETIME = 2.2
+
+# How many of each enemy kind to scatter through the city.
+NUM_GUARDS = 10
+NUM_ARCHERS = 5
+NUM_BRUTES = 3
+
 # Detection meter (0..1). Crossing SUSPICIOUS makes guards investigate; crossing
 # ALERT makes them hostile.
 DETECT_FILL_RATE = 1.25        # per second at full intensity
@@ -99,8 +122,11 @@ C_PLAYER_CROUCH = (170, 190, 220)
 C_GUARD = (180, 60, 60)
 C_GUARD_SUS = (220, 170, 60)
 C_GUARD_ALERT = (235, 70, 70)
+C_ARCHER = (90, 150, 205)
+C_BRUTE = (150, 80, 40)
 C_TARGET = (210, 80, 200)
 C_BLADE = (220, 230, 255)
+C_ARROW = (235, 225, 200)
 
 C_VISION_CALM = (90, 200, 120)
 C_VISION_SUS = (235, 200, 70)

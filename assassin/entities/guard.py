@@ -24,15 +24,44 @@ class GuardState:
     SEARCH = "search"
 
 
+class GuardKind:
+    GUARD = "guard"     # standard melee patrol
+    ARCHER = "archer"   # fragile, fires arrows from range, keeps distance
+    BRUTE = "brute"     # slow, armored, devastating melee
+
+
 class Guard(Entity):
-    def __init__(self, x: float, y: float, waypoints=None):
-        super().__init__(x, y, config.GUARD_RADIUS, config.C_GUARD)
-        self.stats = Stats(
-            max_hp=config.GUARD_BASE_HP,
-            hp=config.GUARD_BASE_HP,
-            attack=config.GUARD_DAMAGE,
-            defense=3,
-        )
+    def __init__(self, x: float, y: float, waypoints=None, kind=GuardKind.GUARD):
+        self.kind = kind
+        radius = config.GUARD_RADIUS + (4 if kind == GuardKind.BRUTE else 0)
+        color = {
+            GuardKind.GUARD: config.C_GUARD,
+            GuardKind.ARCHER: config.C_ARCHER,
+            GuardKind.BRUTE: config.C_BRUTE,
+        }[kind]
+        super().__init__(x, y, radius, color)
+
+        # Per-kind combat stats, speeds and senses.
+        self.patrol_speed = config.GUARD_PATROL_SPEED
+        self.chase_speed = config.GUARD_CHASE_SPEED
+        self.vision_range = config.GUARD_VISION_RANGE
+        self.ranged = False
+        self.shoot_cooldown = 0.0
+        self.on_shoot = None  # callback(self, player) set by the game for archers
+        if kind == GuardKind.ARCHER:
+            self.stats = Stats(max_hp=config.ARCHER_HP, hp=config.ARCHER_HP,
+                               attack=config.ARCHER_DAMAGE, defense=2)
+            self.ranged = True
+            self.vision_range = config.GUARD_VISION_RANGE * config.ARCHER_VISION_MULT
+        elif kind == GuardKind.BRUTE:
+            self.stats = Stats(max_hp=config.BRUTE_HP, hp=config.BRUTE_HP,
+                               attack=config.BRUTE_DAMAGE, defense=config.BRUTE_DEFENSE)
+            self.patrol_speed *= config.BRUTE_SPEED_MULT
+            self.chase_speed *= config.BRUTE_SPEED_MULT
+        else:
+            self.stats = Stats(max_hp=config.GUARD_BASE_HP, hp=config.GUARD_BASE_HP,
+                               attack=config.GUARD_DAMAGE, defense=3)
+
         self.waypoints = waypoints or [(x, y)]
         self.wp_index = 0
         self.state = GuardState.PATROL
@@ -51,7 +80,7 @@ class Guard(Entity):
         if self.dead or player.noise <= 0.0:
             return False, 0.0
         dist = self.distance_to(player)
-        rng = config.GUARD_VISION_RANGE
+        rng = self.vision_range
         if self.state in (GuardState.ALERT, GuardState.SEARCH):
             rng *= 1.15  # heightened awareness once roused
         if not in_vision_cone(self.pos, self.facing, config.GUARD_VISION_FOV, rng, player.pos):
@@ -79,6 +108,8 @@ class Guard(Entity):
             return
         if self.attack_cooldown > 0:
             self.attack_cooldown -= dt
+        if self.shoot_cooldown > 0:
+            self.shoot_cooldown -= dt
 
         visible, intensity = self.can_see(player, world)
         awareness = self.meter.update(dt, visible, intensity)
@@ -101,17 +132,22 @@ class Guard(Entity):
     def _do_patrol(self, dt, world):
         self.state = GuardState.PATROL
         tx, ty = self.waypoints[self.wp_index]
-        if self._move_towards(tx, ty, config.GUARD_PATROL_SPEED, dt, world) < 6.0:
+        if self._move_towards(tx, ty, self.patrol_speed, dt, world) < 6.0:
             self.wp_index = (self.wp_index + 1) % len(self.waypoints)
 
     def _do_suspicious(self, dt, world):
         self.state = GuardState.SUSPICIOUS
         if self.last_seen:
-            self._move_towards(*self.last_seen, config.GUARD_PATROL_SPEED * 1.2, dt, world)
+            self._move_towards(*self.last_seen, self.patrol_speed * 1.2, dt, world)
 
     def _do_alert(self, dt, player, world, visible):
         self.state = GuardState.ALERT
         dist = self.distance_to(player)
+
+        if self.ranged:
+            self._do_alert_ranged(dt, player, world, visible, dist)
+            return
+
         if dist <= config.GUARD_ATTACK_RANGE:
             self.face_towards(player.x, player.y)
             if self.attack_cooldown <= 0:
@@ -124,13 +160,28 @@ class Guard(Entity):
                     self.dead = True
         else:
             target = player.pos if visible else (self.last_seen or player.pos)
-            self._move_towards(*target, config.GUARD_CHASE_SPEED, dt, world)
+            self._move_towards(*target, self.chase_speed, dt, world)
+
+    def _do_alert_ranged(self, dt, player, world, visible, dist):
+        """Archer behavior: keep distance and loose arrows when there's a shot."""
+        self.face_towards(player.x, player.y)
+        if dist < config.ARCHER_KEEP_DISTANCE:
+            # Back away to maintain a firing lane.
+            self._move_towards(2 * self.x - player.x, 2 * self.y - player.y,
+                               self.chase_speed, dt, world)
+        elif dist > config.ARCHER_SHOOT_RANGE:
+            self._move_towards(*(player.pos if visible else (self.last_seen or player.pos)),
+                               self.chase_speed, dt, world)
+        if (visible and dist <= config.ARCHER_SHOOT_RANGE
+                and self.shoot_cooldown <= 0 and self.on_shoot is not None):
+            self.on_shoot(self, player)
+            self.shoot_cooldown = config.ARCHER_SHOOT_COOLDOWN
 
     def _do_search(self, dt, world):
         self.state = GuardState.SEARCH
         self.search_timer -= dt
         if self.last_seen and self.distance_to_point(*self.last_seen) > 10:
-            self._move_towards(*self.last_seen, config.GUARD_PATROL_SPEED, dt, world)
+            self._move_towards(*self.last_seen, self.patrol_speed, dt, world)
         else:
             # Look around at the last known position.
             self._wander_dir += dt * 2.0

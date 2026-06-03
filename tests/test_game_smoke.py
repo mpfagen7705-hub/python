@@ -103,5 +103,64 @@ def test_hidden_in_haystack_makes_player_invisible():
     assert p.noise == 0.0
 
 
+def test_enemy_mix_spawns_all_kinds():
+    from assassin.entities.guard import GuardKind
+    g = Game(seed=5)
+    kinds = {guard.kind for guard in g.guards}
+    assert GuardKind.GUARD in kinds
+    assert GuardKind.ARCHER in kinds
+    assert GuardKind.BRUTE in kinds
+
+
+def test_save_and_load_roundtrip(tmp_path):
+    path = str(tmp_path / "save.json")
+    g = Game(seed=42)
+    g.state = State.PLAYING
+    g.player.stats.add_xp(300)            # gain some progression
+    g.targets[0].dead = True
+    g._awarded.add(id(g.targets[0]))
+    assert g.save_to_file(path)
+
+    g2 = Game(seed=999)                   # different world
+    assert g2.load_from_file(path)
+    assert g2.seed == 42
+    assert g2.player.stats.level == g.player.stats.level
+    assert g2.player.stats.xp == g.player.stats.xp
+    assert g2.targets[0].dead is True
+
+
+def test_load_missing_file_returns_false():
+    g = Game(seed=1)
+    assert not g.load_from_file("/nonexistent/path/save.json")
+
+
+def test_archer_shoot_callback_spawns_projectile():
+    from assassin.entities.guard import GuardKind
+    g = Game(seed=5)
+    archer = next(x for x in g.guards if x.kind == GuardKind.ARCHER)
+    assert archer.on_shoot is not None
+    n0 = len(g.projectiles)
+    archer.on_shoot(archer, g.player)
+    assert len(g.projectiles) == n0 + 1
+
+
+def test_menu_and_controls_render():
+    g = Game(seed=5)
+    g.state = State.MENU
+    g._draw()
+    assert g._menu_rects  # populated during menu draw
+    g.state = State.CONTROLS
+    g._draw()
+
+
+def test_audio_is_safe_when_disabled():
+    from assassin.audio import SoundFX
+    fx = SoundFX()
+    # Whether or not a device exists, play must never raise.
+    fx.play("assassinate")
+    fx.play("nonexistent_sound")
+    assert isinstance(fx.toggle_mute(), bool)
+
+
 def test_pygame_quit_cleanup():
     pygame.quit()

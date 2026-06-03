@@ -7,24 +7,31 @@ and threads input through to the player and menus.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import random
 import sys
 
 import pygame
 
 from . import config, world as worldmod
+from .audio import SoundFX
 from .camera import Camera
-from .entities.guard import Guard, GuardState
+from .entities.guard import Guard, GuardKind, GuardState
 from .entities.player import MoveMode, Player
-from .systems import combat
+from .entities.projectile import Projectile
+from .systems import combat, save as savesys
 from .systems.detection import Awareness, in_vision_cone, line_of_sight
 from .systems.quests import Contract, Objective, QuestLog
 from .ui import hud
 
+SAVE_PATH = os.path.join(os.path.expanduser("~"), ".assassins_reverie_save.json")
+
 
 class State:
     MENU = "menu"
+    CONTROLS = "controls"
     PLAYING = "playing"
     SKILLS = "skills"
     PAUSED = "paused"
@@ -43,9 +50,11 @@ class Game:
             "font": pygame.font.SysFont("consolas,menlo,monospace", 19),
             "big": pygame.font.SysFont("consolas,menlo,monospace", 48, bold=True),
         }
+        self.audio = SoundFX()
         self.seed = seed if seed is not None else random.randint(0, 1_000_000)
         self.state = State.MENU
         self._skill_keymap = {}
+        self.menu_index = 0
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -56,9 +65,12 @@ class Game:
         self.camera = Camera(self.world)
         self.guards: list[Guard] = []
         self.targets: list[Guard] = []
+        self.projectiles: list[Projectile] = []
         self.synced: set = set()
         self.notoriety = 0
         self.peak_awareness = Awareness.UNAWARE
+        self._prev_awareness = Awareness.UNAWARE
+        self._prev_hp = self.player.stats.hp
         self.message = ""
         self.message_timer = 0.0
         self._awarded: set = set()
@@ -85,8 +97,13 @@ class Game:
     def _spawn_guards(self):
         rng = random.Random(self.seed + 1)
         start = (self.player.x, self.player.y)
-        anchors = self._rand_streets(rng, 14, far_from=start, min_dist=260)
-        for (c, r) in anchors:
+        kinds = (
+            [GuardKind.GUARD] * config.NUM_GUARDS
+            + [GuardKind.ARCHER] * config.NUM_ARCHERS
+            + [GuardKind.BRUTE] * config.NUM_BRUTES
+        )
+        anchors = self._rand_streets(rng, len(kinds), far_from=start, min_dist=260)
+        for kind, (c, r) in zip(kinds, anchors):
             x, y = self.world.tile_center_px(c, r)
             # Build a small patrol loop from nearby street tiles.
             wps = [(x, y)]
@@ -94,7 +111,15 @@ class Game:
                 nc, nr = c + rng.randint(-4, 4), r + rng.randint(-4, 4)
                 if self.world.walkable_ground(nc, nr):
                     wps.append(self.world.tile_center_px(nc, nr))
-            self.guards.append(Guard(x, y, waypoints=wps))
+            g = Guard(x, y, waypoints=wps, kind=kind)
+            if g.ranged:
+                g.on_shoot = self._enemy_shoot
+            self.guards.append(g)
+
+    def _enemy_shoot(self, archer, player):
+        ang = math.atan2(player.y - archer.y, player.x - archer.x)
+        self.projectiles.append(Projectile(archer.x, archer.y, ang, archer.stats.attack))
+        self.audio.play("arrow")
 
     def _spawn_targets(self):
         rng = random.Random(self.seed + 2)
@@ -147,14 +172,20 @@ class Game:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self._quit()
+            if self.state == State.MENU and event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION):
+                self._menu_mouse(event)
+                continue
             if event.type != pygame.KEYDOWN:
                 continue
             k = event.key
+            if k == pygame.K_m:  # global mute toggle
+                self.audio.toggle_mute()
+                continue
             if self.state == State.MENU:
-                if k in (pygame.K_RETURN, pygame.K_SPACE):
-                    self.state = State.PLAYING
-                elif k == pygame.K_ESCAPE:
-                    self._quit()
+                self._menu_keys(k)
+            elif self.state == State.CONTROLS:
+                if k in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_BACKSPACE):
+                    self.state = State.MENU
             elif self.state == State.PLAYING:
                 if k == pygame.K_ESCAPE:
                     self.state = State.PAUSED
@@ -172,15 +203,138 @@ class Game:
             elif self.state == State.PAUSED:
                 if k in (pygame.K_ESCAPE, pygame.K_RETURN):
                     self.state = State.PLAYING
+                elif k == pygame.K_s:
+                    if self.save_to_file():
+                        self._flash("Progress saved.")
+                        self.audio.play("select")
                 elif k == pygame.K_q:
-                    self._quit()
+                    self.state = State.MENU
             elif self.state in (State.GAMEOVER, State.VICTORY):
                 if k == pygame.K_RETURN:
                     self.seed = random.randint(0, 1_000_000)
                     self.reset()
                     self.state = State.PLAYING
                 elif k in (pygame.K_ESCAPE, pygame.K_q):
-                    self._quit()
+                    self.state = State.MENU
+
+    # --- main menu --------------------------------------------------------
+    def _menu_actions(self):
+        actions = []
+        if self.has_save():
+            actions.append(("Continue", "continue"))
+        actions.append(("New Game", "new"))
+        actions.append(("Controls", "controls"))
+        actions.append(("Quit", "quit"))
+        return actions
+
+    def _menu_keys(self, k):
+        actions = self._menu_actions()
+        if k in (pygame.K_UP, pygame.K_w):
+            self.menu_index = (self.menu_index - 1) % len(actions)
+            self.audio.play("menu")
+        elif k in (pygame.K_DOWN, pygame.K_s):
+            self.menu_index = (self.menu_index + 1) % len(actions)
+            self.audio.play("menu")
+        elif k in (pygame.K_RETURN, pygame.K_SPACE):
+            self._select_menu(actions[self.menu_index][1])
+        elif k == pygame.K_ESCAPE:
+            self._quit()
+
+    def _menu_mouse(self, event):
+        for i, rect in enumerate(getattr(self, "_menu_rects", [])):
+            if rect.collidepoint(event.pos):
+                if event.type == pygame.MOUSEMOTION and self.menu_index != i:
+                    self.menu_index = i
+                    self.audio.play("menu")
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    self.menu_index = i
+                    self._select_menu(self._menu_actions()[i][1])
+
+    def _select_menu(self, action):
+        self.audio.play("select")
+        if action == "continue":
+            if self.load_from_file():
+                self.state = State.PLAYING
+        elif action == "new":
+            self.seed = random.randint(0, 1_000_000)
+            self.reset()
+            self.state = State.PLAYING
+        elif action == "controls":
+            self.state = State.CONTROLS
+        elif action == "quit":
+            self._quit()
+
+    # --- save / load ------------------------------------------------------
+    def has_save(self) -> bool:
+        return os.path.exists(SAVE_PATH)
+
+    def to_save_dict(self) -> dict:
+        return {
+            "version": savesys.SAVE_VERSION,
+            "seed": self.seed,
+            "stats": savesys.dump_stats(self.player.stats),
+            "skills": savesys.dump_skills(self.player.skills),
+            "player_pos": [self.player.x, self.player.y],
+            "on_roof": self.player.on_roof,
+            "synced": [list(vp) for vp in self.synced],
+            "dead_targets": [i for i, t in enumerate(self.targets) if t.dead],
+            "dead_guards": [i for i, g in enumerate(self.guards) if g.dead],
+            "contracts": [savesys.dump_contract(c) for c in self.quest_log.contracts],
+            "notoriety": self.notoriety,
+            "ghost": self._ghost_intact,
+        }
+
+    def save_to_file(self, path=SAVE_PATH) -> bool:
+        try:
+            with open(path, "w") as fh:
+                json.dump(self.to_save_dict(), fh)
+            return True
+        except OSError:
+            return False
+
+    def apply_save_dict(self, data: dict) -> None:
+        self.seed = data["seed"]
+        self.reset()
+        savesys.load_stats(self.player.stats, data["stats"])
+        savesys.load_skills(self.player.skills, data["skills"], self.player)
+        self.player.x, self.player.y = data["player_pos"]
+        self.player.on_roof = data.get("on_roof", False)
+        self.synced = {tuple(vp) for vp in data.get("synced", [])}
+        for vp in self.synced:
+            self.world.reveal(vp[0], vp[1], 11)
+        for i in data.get("dead_targets", []):
+            if i < len(self.targets):
+                self.targets[i].dead = True
+                self._awarded.add(id(self.targets[i]))
+        for i in data.get("dead_guards", []):
+            if i < len(self.guards):
+                self.guards[i].dead = True
+                self._awarded.add(id(self.guards[i]))
+        by_key = {c["key"]: c for c in data.get("contracts", [])}
+        for c in self.quest_log.contracts:
+            if c.key in by_key:
+                savesys.load_contract(c, by_key[c.key])
+        self.notoriety = data.get("notoriety", 0)
+        self._ghost_intact = data.get("ghost", True)
+        self._prev_hp = self.player.stats.hp
+
+    def load_from_file(self, path=SAVE_PATH) -> bool:
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            if data.get("version") != savesys.SAVE_VERSION:
+                return False
+            self.apply_save_dict(data)
+            return True
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def _delete_save(self):
+        try:
+            if os.path.exists(SAVE_PATH):
+                os.remove(SAVE_PATH)
+        except OSError:
+            pass
 
     def _quit(self):
         pygame.quit()
@@ -217,6 +371,21 @@ class Game:
             self._ghost_intact = False
             self.notoriety = min(3, max(self.notoriety, 1 + len(
                 [g for g in enemies if g.state == GuardState.ALERT]) // 4))
+        # Alarm sting on the rising edge of being detected.
+        if (self.peak_awareness is Awareness.ALERT
+                and self._prev_awareness is not Awareness.ALERT):
+            self.audio.play("alert")
+        self._prev_awareness = self.peak_awareness
+
+        # Arrows in flight.
+        for p in self.projectiles:
+            p.update(dt, self.world, self.player)
+        self.projectiles = [p for p in self.projectiles if p.alive]
+
+        # Wince when the player loses health (melee or arrow).
+        if self.player.stats.hp < self._prev_hp:
+            self.audio.play("hurt")
+        self._prev_hp = self.player.stats.hp
 
         self._reconcile_deaths()
         self.camera.follow(self.player, dt)
@@ -226,8 +395,13 @@ class Game:
         if earned:
             self._grant_xp(earned)
         if not self.player.stats.alive:
+            if self.state != State.GAMEOVER:
+                self.audio.play("death")
             self.state = State.GAMEOVER
         elif self._check_victory():
+            if self.state != State.VICTORY:
+                self.audio.play("sync")
+                self._delete_save()  # contracts done — clear the slot
             self.state = State.VICTORY
 
         if self.message_timer > 0:
@@ -256,6 +430,7 @@ class Game:
                 self._grant_xp(xp)
                 if g.is_target:
                     self.quest_log.contracts[0].advance("eliminate")
+                    self.audio.play("select")
                     self._flash(f"{getattr(g, 'name', 'Target')} eliminated!  +{xp} XP")
 
     # --------------------------------------------------------------- actions
@@ -289,6 +464,7 @@ class Game:
         if dist <= config.GUARD_ATTACK_RANGE + 6:
             self.player.face_towards(nearest.x, nearest.y)
             res = combat.resolve_attack(self.player.stats, nearest.stats)
+            self.audio.play("hit")
             if res.lethal:
                 nearest.dead = True
 
@@ -297,6 +473,7 @@ class Game:
         combat.resolve_attack(self.player.stats, target.stats,
                               assassination=True, defender_aware=False)
         target.dead = True
+        self.audio.play("assassinate")
 
     def _interact(self):
         # Synchronize a viewpoint when perched on one.
@@ -309,6 +486,7 @@ class Game:
                     self.world.reveal(vp[0], vp[1], radius)
                     self._grant_xp(config.XP_VIEWPOINT)
                     self.quest_log.contracts[1].advance("sync")
+                    self.audio.play("sync")
                     self._flash(f"Viewpoint synchronized!  +{config.XP_VIEWPOINT} XP")
                     return
         # Otherwise attempt to climb up/down.
@@ -317,11 +495,13 @@ class Game:
     def _unlock_skill(self, number):
         key = self._skill_keymap.get(number)
         if key and self.player.skills.unlock(key, self.player.stats, self.player):
+            self.audio.play("select")
             self._flash(f"Unlocked: {self.player.skills.get(key).name}")
 
     def _grant_xp(self, amount):
         levels = self.player.stats.add_xp(amount)
         if levels:
+            self.audio.play("levelup")
             self._flash(f"LEVEL UP!  Now level {self.player.stats.level}  (TAB for skills)")
 
     def _flash(self, text, secs=3.0):
@@ -334,13 +514,20 @@ class Game:
         if self.state == State.MENU:
             self._draw_menu()
             return
+        if self.state == State.CONTROLS:
+            self._draw_controls()
+            return
         self._draw_world()
         self._draw_vision_cones()
         self._draw_entities()
+        self._draw_projectiles()
         self._draw_prompts()
         hud.draw_hud(self.screen, self.fonts, self.player, self.quest_log,
                      self.notoriety, self.peak_awareness)
         hud.draw_minimap(self.screen, self.world, self.player, self.guards, self.targets)
+        if self.audio.muted:
+            self.screen.blit(self.fonts["small"].render("muted (M)", True, config.C_HUD_DIM),
+                             (12, 104))
         if self.message:
             self._draw_flash()
 
@@ -348,37 +535,84 @@ class Game:
             self._skill_keymap = hud.draw_skill_tree(self.screen, self.fonts, self.player)
         elif self.state == State.PAUSED:
             hud.draw_center_message(self.screen, self.fonts, "PAUSED",
-                                    "ENTER resume   •   Q quit")
+                                    "ENTER resume   •   S save   •   Q main menu")
         elif self.state == State.GAMEOVER:
             hud.draw_center_message(self.screen, self.fonts, "CAUGHT",
-                                    "You fell to the city guard.\nENTER new contract   •   Q quit",
+                                    "You fell to the city guard.\nENTER new contract   •   Q main menu",
                                     color=config.C_GUARD_ALERT)
         elif self.state == State.VICTORY:
             hud.draw_center_message(self.screen, self.fonts, "VICTORY",
-                                    "Every contract fulfilled. The Creed endures.\nENTER new city   •   Q quit",
+                                    "Every contract fulfilled. The Creed endures.\nENTER new city   •   Q main menu",
                                     color=config.C_VIEWPOINT)
 
     def _draw_menu(self):
         big, font, small = self.fonts["big"], self.fonts["font"], self.fonts["small"]
         t = config.TITLE
         self.screen.blit(big.render(t, True, config.C_GOLD),
-                         (config.SCREEN_WIDTH // 2 - big.size(t)[0] // 2, 160))
-        lines = [
-            "A 2D stealth-action RPG. Strike from the shadows, vanish across the rooftops.",
-            "",
-            "WASD / Arrows — move        Shift — sprint        Ctrl — sneak (hide in hay)",
-            "Space — strike / assassinate    F — block/parry    E — climb / synchronize",
-            "Tab — skill tree            Esc — pause",
-            "",
-            "Assassinate from behind or while unseen for a silent kill.",
-            "Reach rooftop viewpoints to chart the city. Eliminate your targets.",
-            "",
-            "Press ENTER to begin",
+                         (config.SCREEN_WIDTH // 2 - big.size(t)[0] // 2, 130))
+        tag = "A 2D stealth-action RPG — strike from the shadows, vanish across the rooftops."
+        self.screen.blit(font.render(tag, True, config.C_HUD_DIM),
+                         (config.SCREEN_WIDTH // 2 - font.size(tag)[0] // 2, 200))
+
+        actions = self._menu_actions()
+        self.menu_index = max(0, min(self.menu_index, len(actions) - 1))
+        self._menu_rects = []
+        for i, (label, _) in enumerate(actions):
+            selected = i == self.menu_index
+            col = config.C_GOLD if selected else config.C_HUD_TEXT
+            text = f">  {label}  <" if selected else label
+            surf = font.render(text, True, col)
+            x = config.SCREEN_WIDTH // 2 - surf.get_width() // 2
+            y = 300 + i * 46
+            self.screen.blit(surf, (x, y))
+            # Clickable region (use a stable width centered on screen).
+            self._menu_rects.append(pygame.Rect(config.SCREEN_WIDTH // 2 - 140, y - 6, 280, 38))
+
+        foot = "↑/↓ or mouse to choose · Enter to select · M mute"
+        self.screen.blit(small.render(foot, True, config.C_HUD_DIM),
+                         (config.SCREEN_WIDTH // 2 - small.size(foot)[0] // 2,
+                          config.SCREEN_HEIGHT - 60))
+
+    def _draw_controls(self):
+        big, font, small = self.fonts["big"], self.fonts["font"], self.fonts["small"]
+        title = "CONTROLS"
+        self.screen.blit(big.render(title, True, config.C_GOLD),
+                         (config.SCREEN_WIDTH // 2 - big.size(title)[0] // 2, 70))
+        rows = [
+            ("W A S D / Arrows", "Move"),
+            ("Shift", "Sprint (fast, but easy to spot)"),
+            ("Ctrl", "Sneak / crouch — hide inside haystacks"),
+            ("Space", "Strike — assassinate if unseen/behind, else attack"),
+            ("F", "Block / parry (unlock Counter Strike to riposte)"),
+            ("E", "Climb up/down · Synchronize a viewpoint"),
+            ("Tab", "Skill tree (spend points with number keys)"),
+            ("Esc", "Pause (save from the pause menu)"),
+            ("M", "Mute / unmute"),
         ]
-        for i, ln in enumerate(lines):
-            col = config.C_GOLD if ln == "Press ENTER to begin" else config.C_HUD_TEXT
-            self.screen.blit(font.render(ln, True, col),
-                             (config.SCREEN_WIDTH // 2 - font.size(ln)[0] // 2, 250 + i * 30))
+        y = 170
+        for key, desc in rows:
+            self.screen.blit(font.render(key, True, config.C_HUD_XP), (200, y))
+            self.screen.blit(font.render(desc, True, config.C_HUD_TEXT), (440, y))
+            y += 40
+        tips = [
+            "Enemies: red guards (melee) · blue archers (ranged) · big orange brutes (heavy).",
+            "Rooftops are safe — guards can't follow or easily see you up high.",
+        ]
+        for i, tip in enumerate(tips):
+            self.screen.blit(small.render(tip, True, config.C_HUD_DIM),
+                             (config.SCREEN_WIDTH // 2 - small.size(tip)[0] // 2, y + 10 + i * 22))
+        foot = "Press ENTER or ESC to go back"
+        self.screen.blit(small.render(foot, True, config.C_GOLD),
+                         (config.SCREEN_WIDTH // 2 - small.size(foot)[0] // 2,
+                          config.SCREEN_HEIGHT - 50))
+
+    def _draw_projectiles(self):
+        for p in self.projectiles:
+            sx, sy = self.camera.to_screen(p.x, p.y)
+            ex = sx - math.cos(p.facing) * 10
+            ey = sy - math.sin(p.facing) * 10
+            pygame.draw.line(self.screen, config.C_ARROW, (ex, ey), (sx, sy), 2)
+            pygame.draw.circle(self.screen, config.C_ARROW, (int(sx), int(sy)), 2)
 
     def _draw_world(self):
         cam = self.camera
@@ -418,7 +652,7 @@ class Game:
                 pygame.draw.circle(self.screen, (40, 40, 40), (int(sx), int(sy)), 11, 1)
 
     def _cone_polygon(self, guard):
-        rng = config.GUARD_VISION_RANGE
+        rng = guard.vision_range
         if guard.state in (GuardState.ALERT, GuardState.SEARCH):
             rng *= 1.15
         half = config.GUARD_VISION_FOV / 2
@@ -459,13 +693,11 @@ class Game:
                                  (sx - 8, sy - 8), (sx + 8, sy + 8), 2)
                 continue
             sx, sy = cam.to_screen(g.x, g.y)
-            color = g.color
-            if not g.is_target:
-                color = {
-                    Awareness.UNAWARE: config.C_GUARD,
-                    Awareness.SUSPICIOUS: config.C_GUARD_SUS,
-                    Awareness.ALERT: config.C_GUARD_ALERT,
-                }[g.meter.state]
+            color = g.color  # keeps each kind's identity while unaware
+            if not g.is_target and g.meter.state is Awareness.SUSPICIOUS:
+                color = config.C_GUARD_SUS
+            elif not g.is_target and g.meter.state is Awareness.ALERT:
+                color = config.C_GUARD_ALERT
             pygame.draw.circle(self.screen, color, (int(sx), int(sy)), g.radius)
             # facing nub
             fx = sx + math.cos(g.facing) * g.radius
